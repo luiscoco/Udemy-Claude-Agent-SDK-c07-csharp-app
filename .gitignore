@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+*.user
+.env*
+!.env.example
+*.log
+*.pem
+*.key
+.DS_Store

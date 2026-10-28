@@ -1,0 +1,126 @@
+@page "/architecture"
+
+<PageTitle>C07 · Architecture and workflow</PageTitle>
+
+<main class="student-shell">
+    <div class="student-brand"><a href="/">How <span>Claude Managed Agents</span> Works</a><span class="student-badge">CONCEPT 07 / 60</span></div>
+    <div class="student-hero">
+        <div>
+            <div class="student-eyebrow">ARCHITECTURE &amp; WORKFLOW</div>
+            <h1>Session Outcomes and Stop Reasons</h1>
+            <p>A Blazor Server host calls the Managed Agents API with the official Anthropic C# SDK. The browser never receives the API key.</p>
+        </div>
+        <img src="astronaut.png" alt="">
+    </div>
+    <StudentNav />
+
+    <section class="student-section">
+        <h2>Step 0 · Prepare the application before the workflow</h2>
+        <p>Set the prerequisites in <code>.env</code>. If you do not have resource IDs yet, the optional setup command creates the environment first, then a text-only agent, and saves each ID as soon as it exists.</p>
+        <p class="student-source">Source: src/LessonC07.App/Lab/ResourceSetup.cs</p>
+        <pre><code class="language-csharp">AnthropicClient client = new() { MaxRetries = 0 };
+
+var environment = await client.Beta.Environments.Create(new EnvironmentCreateParams
+{
+    Name = "C07 student environment",
+    Config = new BetaCloudConfigParams { Networking = new BetaLimitedNetworkParams() },
+});
+// Save immediately so a later agent failure does not lose the environment ID.
+DotEnv.Save(envPath, "CLAUDE_MANAGED_ENVIRONMENT_ID", environment.ID);
+
+var agent = await client.Beta.Agents.Create(new AgentCreateParams
+{
+    Name = "C07 text-only student agent",
+    Model = new BetaManagedAgentsModelConfigParams { ID = "claude-opus-5-5" },
+    System = "Answer the student's question clearly and briefly.",
+    Tools = [], McpServers = [], Skills = [],
+});
+DotEnv.Save(envPath, "CLAUDE_MANAGED_AGENT_ID", agent.ID);</code></pre>
+    </section>
+
+    <section class="student-section">
+        <h2>Sequence</h2>
+        <div class="student-table">
+            <table>
+                <thead><tr><th>#</th><th>From → To</th><th>Message</th></tr></thead>
+                <tbody>
+                    <tr><td>1</td><td>Student → Browser</td><td>Enter a prompt and press <em>Start and observe</em>.</td></tr>
+                    <tr><td>2</td><td>Browser → Blazor host</td><td>Click event over the interactive-server SignalR circuit (same origin, loopback only).</td></tr>
+                    <tr><td>3</td><td>Host → Anthropic API</td><td><code>client.Beta.Sessions.Create</code> with the configured agent, environment and budget.</td></tr>
+                    <tr><td>4</td><td>Host → Anthropic API</td><td>Open the event stream (<code>Events.StreamStreaming</code>) before sending anything.</td></tr>
+                    <tr><td>5</td><td>Host → Anthropic API</td><td><code>Events.Send</code> a <code>user.message</code> with the prompt.</td></tr>
+                    <tr><td>6</td><td>Anthropic API → Host</td><td>Live events: status running, model spans, <code>agent.message</code>, then idle, terminated or error.</td></tr>
+                    <tr><td>7</td><td>Host → Browser</td><td>Each event type, answer text, stop reason and the classified outcome re-render the page.</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="student-section">
+        <h2>Walk through the application step by step</h2>
+        <article class="student-step">
+            <h3>1 · Create the session and open the stream first</h3>
+            <p>The stream only delivers events that happen after it opens, so the host starts reading before it sends the prompt.</p>
+            <p class="student-source">Source: src/LessonC07.App/Lab/SessionRunner.cs</p>
+            <pre><code class="language-csharp">var session = await client.Beta.Sessions.Create(new SessionCreateParams
+{
+    Agent = settings.AgentId,
+    EnvironmentID = settings.EnvironmentId,
+    Budget = new BetaManagedAgentsBudgetLimit
+    {
+        MaxListCost = new BetaMonetaryAmount { Amount = "50", Currency = "USD" },
+    },
+}, ct);
+
+await using var live = client.Beta.Sessions.Events
+    .StreamStreaming(session.ID, new EventStreamParams(), ct)
+    .GetAsyncEnumerator(ct);
+var next = live.MoveNextAsync();
+
+await client.Beta.Sessions.Events.Send(session.ID, new EventSendParams
+{
+    Events = [new BetaManagedAgentsUserMessageEventParams
+    {
+        Content = [new BetaManagedAgentsTextBlock { Text = prompt.Trim() }],
+    }],
+}, ct);</code></pre>
+        </article>
+        <article class="student-step">
+            <h3>2 · Apply the classifier to observed idle state</h3>
+            <p>The handler reports both the stop reason and the classified outcome. A pause does not become completed merely because some answer text was received.</p>
+            <pre><code class="language-csharp">if (ev.TryPickSessionStatusIdleEvent(out var idle))
+{
+    var reason = idle.StopReason.Json.GetProperty("type").GetString();
+    outcome = OutcomeClassifier.Classify("idle", reason, false);
+    await send(new("reason", reason ?? "unknown"));
+    break;
+}</code></pre>
+        </article>
+        <article class="student-step">
+            <h3>3 · Classify lifecycle and stop reason together</h3>
+            <p>Terminated, incomplete, requires-action, budget pause and ordinary end_turn have different outcomes. The interrupted flag is an input to the classifier; the web path passes false and does not implement a cancellation workflow.</p>
+            <p class="student-source">Source: src/LessonC07.App/Lab/OutcomeClassifier.cs</p>
+            <pre><code class="language-csharp">public static string Classify(string status, string? reason, bool interrupted)
+{
+    if (status == "terminated") return Outcome.Terminated;
+    if (status != "idle") return Outcome.Incomplete;
+    if (reason == "requires_action") return Outcome.RequiresAction;
+    if (reason == "budget_reached") return Outcome.PausedBudget;
+    if (reason == "end_turn") return interrupted ? Outcome.Interrupted : Outcome.Completed;
+    return Outcome.Error;
+}</code></pre>
+        </article>
+        <article class="student-step">
+            <h3>4 · Render the evidence in the browser</h3>
+            <p>The <code>Home</code> component runs in interactive server mode. Each update is applied on the circuit and re-rendered, which replaces the Node app's NDJSON stream and browser-side parser.</p>
+            <p class="student-source">Source: src/LessonC07.App/Components/Pages/Home.razor</p>
+            <pre><code class="language-csharp">await Runner.RunAsync(text, update => InvokeAsync(() => { Apply(update); StateHasChanged(); }), disposed.Token);
+if (!finished &amp;&amp; !failed &amp;&amp; !disposed.IsCancellationRequested)
+{
+    outcome = "Incomplete";
+    status = "Stream ended without a terminal outcome.";
+}</code></pre>
+        </article>
+    </section>
+    <footer>LESSON C07 · LEARN → CONFIGURE → RUN → VERIFY<p><a href="guide#learning">Learning goals</a> · <a href="guide#run-guide">Run instructions</a> · <a href="architecture">Workflow</a> · <a href="/#application-lab">Lab</a></p></footer>
+</main>
